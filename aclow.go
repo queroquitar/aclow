@@ -154,6 +154,11 @@ func (a *App) DeleteResource(key string) {
 	}
 }
 
+func (a *App) Resource(key string) interface{} {
+	value, _ := a.GetResource(key)
+	return value
+}
+
 func (a *App) executeLocalNode(address string, msg Message, localNode Node, notifyOnError bool) (reply Message, err error) {
 	defer func() {
 		if r := recover(); r != nil {
