@@ -4,12 +4,13 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/AlexMarco7/aclow"
+	"github.com/queroquitar/aclow"
 )
 
 func main() {
 
 	startOpt := aclow.StartOptions{
+		Local:         true,
 		Debug:         true,
 		Host:          "localhost",
 		Port:          4222,

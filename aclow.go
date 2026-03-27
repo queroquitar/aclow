@@ -6,12 +6,8 @@ import (
 	"net/url"
 	"runtime/debug"
 	"sync"
-	"time"
 
 	"github.com/google/uuid"
-
-	server "github.com/nats-io/gnatsd/server"
-	nats "github.com/nats-io/go-nats"
 )
 
 type StartOptions struct {
@@ -32,13 +28,16 @@ type Node interface {
 }
 
 type App struct {
-	opt       StartOptions
-	Conn      *nats.EncodedConn
-	Config    map[string]interface{}
-	Resources map[string]interface{}
-	NodeMap   map[string]Node
-	Logger    Logger
-	OnError   func(address string, msg Message, err error)
+	opt StartOptions
+	// Deprecated: remote execution was removed; kept only for compatibility.
+	Conn          interface{}
+	Config        map[string]interface{}
+	Resources     map[string]interface{}
+	SyncResources *sync.Map
+	NodeMap       map[string]Node
+	Logger        Logger
+	OnError       func(address string, msg Message, err error)
+	resourcesMu   sync.RWMutex
 }
 
 type Message struct {
@@ -53,16 +52,13 @@ type ReplyMessage struct {
 
 func (a *App) Start(opt StartOptions) {
 	a.opt = opt
+	a.opt.Local = true
 	a.Config = make(map[string]interface{})
 	a.Resources = make(map[string]interface{})
+	a.SyncResources = &sync.Map{}
 	a.NodeMap = make(map[string]Node)
 
 	a.Logger.start()
-
-	if !opt.Local {
-		a.startServer()
-		a.startClient()
-	}
 }
 
 func (a *App) Wait() {
@@ -71,214 +67,128 @@ func (a *App) Wait() {
 	wg.Wait()
 }
 
-func (a *App) startServer() {
-	server := server.New(&server.Options{
-		Host:   a.opt.Host,
-		Port:   a.opt.Port,
-		Routes: a.opt.ClusterRoutes,
-		Cluster: server.ClusterOpts{
-			Port: a.opt.ClusterPort,
-		},
-	})
-
-	go server.Start()
-
-	time.Sleep(time.Second * 1)
-}
-
-func (a *App) startClient() {
-	nc, err := nats.Connect(fmt.Sprintf("localhost:%d", a.opt.Port))
-	a.Conn, _ = nats.NewEncodedConn(nc, nats.GOB_ENCODER)
-
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
 func (a *App) Publish(address string, msg Message) {
 	localNode := a.NodeMap[address]
 
-	if localNode == nil && !a.opt.Local {
-		a.Conn.Publish(address, msg)
-	} else if localNode == nil {
+	if localNode == nil {
 		err := fmt.Errorf("Address '%s' not found!", address)
 		log.Println(err)
-	} else {
-		var err error
+		return
+	}
 
-		defer func() {
-			if r := recover(); r != nil {
-				log.Println("Recovered:", r)
-				log.Println(string(debug.Stack()))
-				err = fmt.Errorf("Panic error on call: %v %v \n %v", localNode.Address(), r, string(debug.Stack()))
-				if a.OnError != nil {
-					go func() { a.OnError(address, msg, err) }()
-				}
-			}
-		}()
-
-		executionID := uuid.New().String()
-		a.logIt(Log{
-			logType:     "starting-execution",
-			executionID: executionID,
-			address:     address,
-			message:     msg,
-		})
-
-		reply, err := localNode.Execute(msg, a.makeCaller(address, executionID))
-
-		a.logIt(Log{
-			logType:     "ending-execution",
-			executionID: executionID,
-			address:     address,
-			message:     reply,
-			err:         err,
-		})
-
-		if err != nil {
-			log.Println("Error executing:", address)
-			log.Println(string(debug.Stack()))
-		}
+	if _, err := a.executeLocalNode(address, msg, localNode, false); err != nil {
+		log.Println("Error executing:", address)
+		log.Println(string(debug.Stack()))
 	}
 }
 
 func (a *App) Call(address string, msg Message) (r Message, err error) {
 	localNode := a.NodeMap[address]
-	if localNode == nil && !a.opt.Local {
-		replyMsg := ReplyMessage{}
-		err = a.Conn.Request(address, msg, &replyMsg, time.Second*30)
-		if replyMsg.Err != nil {
-			return Message{}, replyMsg.Err
-		}
-		r.Body = replyMsg.Body
-		r.Header = replyMsg.Header
-		if err != nil {
-			log.Println("Error executing:", address, " => ", err.Error())
-			log.Println(string(debug.Stack()))
-			if a.OnError != nil {
-				go func() { a.OnError(address, msg, err) }()
-			}
-		}
-		return r, err
-	} else if localNode == nil {
-		err := fmt.Errorf(fmt.Sprintf("Address '%s' not found!", address))
+	if localNode == nil {
+		err := fmt.Errorf("Address '%s' not found!", address)
 		if a.OnError != nil {
 			go func() { a.OnError(address, msg, err) }()
 		}
 		return Message{}, err
-	} else {
-		defer func() {
-			if r := recover(); r != nil {
-				log.Println("Recovered:", r)
-				log.Println(string(debug.Stack()))
-				err = fmt.Errorf("Panic error on call: %v %v \n %v", localNode.Address(), r, string(debug.Stack()))
-				if a.OnError != nil {
-					go func() { a.OnError(address, msg, err) }()
-				}
-			}
-		}()
-
-		executionID := uuid.New().String()
-		a.logIt(Log{
-			logType:     "starting-execution",
-			executionID: executionID,
-			address:     address,
-			message:     msg,
-		})
-
-		reply, err := localNode.Execute(msg, a.makeCaller(address, executionID))
-		a.logIt(Log{
-			logType:     "ending-execution",
-			executionID: executionID,
-			address:     address,
-			message:     reply,
-			err:         err,
-		})
-
-		if err != nil {
-			log.Println("Error executing:", address, " => ", err.Error())
-			log.Println(string(debug.Stack()))
-			if a.OnError != nil {
-				go func() { a.OnError(address, msg, err) }()
-			}
-		}
-
-		return reply, err
 	}
+
+	reply, err := a.executeLocalNode(address, msg, localNode, true)
+	if err != nil {
+		log.Println("Error executing:", address, " => ", err.Error())
+		log.Println(string(debug.Stack()))
+	}
+
+	return reply, err
 }
 
 func (a *App) RegisterModule(moduleName string, nodes []Node) {
 	for _, n := range nodes {
-		//go func(n Node) {
 		for _, addr := range n.Address() {
 			nodeAddress := moduleName + "@" + addr
 
 			a.NodeMap[nodeAddress] = n
-
-			if !a.opt.Local {
-				_, err := a.Conn.QueueSubscribe(nodeAddress, moduleName, func(_, reply string, msg Message) {
-
-					executionID := uuid.New().String()
-					a.logIt(Log{
-						logType:     "starting-execution",
-						executionID: executionID,
-						address:     nodeAddress,
-						message:     msg,
-					})
-
-					go func(msg Message) {
-						defer func() {
-							if r := recover(); r != nil {
-								log.Println("Recovered:", r)
-								log.Println(string(debug.Stack()))
-								err := fmt.Errorf("Panic error on call: %v %v \n %v", nodeAddress, r, string(debug.Stack()))
-								if a.OnError != nil {
-									go func() { a.OnError(nodeAddress, msg, err) }()
-								}
-								a.Conn.Publish(reply, ReplyMessage{Err: err})
-							}
-						}()
-
-						caller := a.makeCaller(nodeAddress, executionID)
-
-						result, err := n.Execute(msg, caller)
-
-						a.logIt(Log{
-							logType:     "ending-execution",
-							executionID: executionID,
-							address:     nodeAddress,
-							message:     result,
-							err:         err,
-						})
-
-						if err != nil {
-							log.Println("Error executing:", nodeAddress)
-							log.Println(string(debug.Stack()))
-							if a.OnError != nil {
-								go func() { a.OnError(nodeAddress, msg, err) }()
-							}
-
-							if reply != "" {
-								a.Conn.Publish(reply, ReplyMessage{Err: err})
-							}
-						} else if reply != "" {
-							a.Conn.Publish(reply, result)
-						}
-					}(msg)
-
-				})
-
-				if err != nil {
-					println(err.Error)
-				}
-			}
-
 		}
 
 		go n.Start(a)
-
-		//}(n)
 	}
+}
+
+func (a *App) SetResource(key string, value interface{}) {
+	a.resourcesMu.Lock()
+	defer a.resourcesMu.Unlock()
+
+	if a.Resources == nil {
+		a.Resources = make(map[string]interface{})
+	}
+	if a.SyncResources == nil {
+		a.SyncResources = &sync.Map{}
+	}
+
+	a.Resources[key] = value
+	a.SyncResources.Store(key, value)
+}
+
+func (a *App) GetResource(key string) (interface{}, bool) {
+	if a.SyncResources != nil {
+		if value, ok := a.SyncResources.Load(key); ok {
+			return value, true
+		}
+	}
+
+	a.resourcesMu.RLock()
+	defer a.resourcesMu.RUnlock()
+
+	value, ok := a.Resources[key]
+	return value, ok
+}
+
+func (a *App) DeleteResource(key string) {
+	a.resourcesMu.Lock()
+	defer a.resourcesMu.Unlock()
+
+	if a.Resources != nil {
+		delete(a.Resources, key)
+	}
+	if a.SyncResources != nil {
+		a.SyncResources.Delete(key)
+	}
+}
+
+func (a *App) executeLocalNode(address string, msg Message, localNode Node, notifyOnError bool) (reply Message, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Println("Recovered:", r)
+			log.Println(string(debug.Stack()))
+			err = fmt.Errorf("Panic error on call: %v %v \n %v", localNode.Address(), r, string(debug.Stack()))
+			if a.OnError != nil {
+				go func() { a.OnError(address, msg, err) }()
+			}
+		}
+	}()
+
+	executionID := uuid.New().String()
+	a.logIt(Log{
+		logType:     "starting-execution",
+		executionID: executionID,
+		address:     address,
+		message:     msg,
+	})
+
+	reply, err = localNode.Execute(msg, a.makeCaller(address, executionID))
+
+	a.logIt(Log{
+		logType:     "ending-execution",
+		executionID: executionID,
+		address:     address,
+		message:     reply,
+		err:         err,
+	})
+
+	if err != nil && notifyOnError && a.OnError != nil {
+		go func() { a.OnError(address, msg, err) }()
+	}
+
+	return reply, err
 }
 
 func (a *App) makeCaller(fromAddress string, executionID string) Caller {
