@@ -34,10 +34,11 @@ type App struct {
 	Config        map[string]interface{}
 	Resources     map[string]interface{}
 	SyncResources *sync.Map
-	NodeMap       map[string]Node
+	NodeMap       *sync.Map
 	Logger        Logger
 	OnError       func(address string, msg Message, err error)
 	resourcesMu   sync.RWMutex
+	nodeMapOnce   sync.Once
 }
 
 type Message struct {
@@ -56,7 +57,7 @@ func (a *App) Start(opt StartOptions) {
 	a.Config = make(map[string]interface{})
 	a.Resources = make(map[string]interface{})
 	a.SyncResources = &sync.Map{}
-	a.NodeMap = make(map[string]Node)
+	a.NodeMap = &sync.Map{}
 
 	a.Logger.start()
 }
@@ -68,7 +69,7 @@ func (a *App) Wait() {
 }
 
 func (a *App) Publish(address string, msg Message) {
-	localNode := a.NodeMap[address]
+	localNode := a.getNode(address)
 
 	if localNode == nil {
 		err := fmt.Errorf("Address '%s' not found!", address)
@@ -83,7 +84,7 @@ func (a *App) Publish(address string, msg Message) {
 }
 
 func (a *App) Call(address string, msg Message) (r Message, err error) {
-	localNode := a.NodeMap[address]
+	localNode := a.getNode(address)
 	if localNode == nil {
 		err := fmt.Errorf("Address '%s' not found!", address)
 		if a.OnError != nil {
@@ -102,15 +103,39 @@ func (a *App) Call(address string, msg Message) (r Message, err error) {
 }
 
 func (a *App) RegisterModule(moduleName string, nodes []Node) {
+	a.initNodeMap()
+
 	for _, n := range nodes {
 		for _, addr := range n.Address() {
 			nodeAddress := moduleName + "@" + addr
 
-			a.NodeMap[nodeAddress] = n
+			a.NodeMap.Store(nodeAddress, n)
 		}
 
 		go n.Start(a)
 	}
+}
+
+func (a *App) initNodeMap() {
+	a.nodeMapOnce.Do(func() {
+		if a.NodeMap == nil {
+			a.NodeMap = &sync.Map{}
+		}
+	})
+}
+
+func (a *App) getNode(address string) Node {
+	if a.NodeMap == nil {
+		return nil
+	}
+
+	node, ok := a.NodeMap.Load(address)
+	if !ok {
+		return nil
+	}
+
+	localNode, _ := node.(Node)
+	return localNode
 }
 
 func (a *App) SetResource(key string, value interface{}) {
